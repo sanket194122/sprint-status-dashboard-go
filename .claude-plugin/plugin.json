@@ -1,0 +1,9 @@
+{
+  "name": "sprint-status-dashboard",
+  "description": "Generates a complete real-time JIRA sprint analytics dashboard with AI-powered risk analysis, Teams notifications, team capacity heatmap, and Framer/Raycast dark UI. Zero npm dependencies — just Node.js.",
+  "version": "2.0.0",
+  "author": {
+    "name": "NICE CXone"
+  },
+  "keywords": ["sprint", "dashboard", "jira", "agile", "analytics", "epic-risk", "team-velocity", "real-time", "ai", "teams-notifications", "heatmap"]
+}
