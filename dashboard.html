@@ -586,7 +586,8 @@
         <div id="emptyState" style="display:none;text-align:center;padding:80px 20px;">
             <div style="font-size:64px;margin-bottom:16px;animation:fadeUp 0.5s ease;">🔍</div>
             <h3 id="emptyMsg" style="font-size:20px;font-weight:600;color:var(--text);margin-bottom:8px;">No data found</h3>
-            <p style="font-size:13px;color:var(--text-tertiary);margin-bottom:24px;">This sprint might not be assigned to your team.</p>
+            <p id="emptyWitty" style="font-size:14px;color:var(--text-secondary);margin-bottom:8px;font-style:italic;"></p>
+            <p style="font-size:12px;color:var(--text-tertiary);margin-bottom:24px;">Try selecting a different sprint from the dropdown above.</p>
             <button class="sel-btn" onclick="switchToActiveSprint()" style="background:linear-gradient(135deg,var(--accent),var(--accent-secondary));">Switch to Active Sprint</button>
         </div>
 
@@ -923,15 +924,16 @@
             try {
                 const d = await fetchJSON(`/api/all?${params}`);
                 stopLoadingMessages();
-                if (d.empty) { showEmptyState(d.message); return; }
+                if (d.empty || d.error) { showEmptyState(d.message || d.error || 'No data found'); return; }
                 render(d.sprint, d.summary, d.health, d.issues, d.ai, d.advanced, d.history);
             } catch(e) { stopLoadingMessages(); document.getElementById('loading').innerHTML = `<p style="color:var(--danger)">${e.message}</p><button class="sel-btn" onclick="fetchAll()" style="margin-top:16px">Retry</button>`; }
         }
 
         // Render
         function render(sprint, summary, health, issues, ai, advanced, history) {
+            if (!sprint || !summary) { showEmptyState('No data available. Select a valid sprint.'); return; }
             allIssues = issues || [];
-            if (sprint.jiraBaseUrl) jiraBaseUrl = sprint.jiraBaseUrl;
+            if (sprint && sprint.jiraBaseUrl) jiraBaseUrl = sprint.jiraBaseUrl;
             document.getElementById('loading').style.display = 'none'; document.getElementById('dashboard').style.display = 'block';
 
             // AI insight banner
@@ -988,13 +990,17 @@
         }
 
         function renderDonut(s) {
-            const ctx = document.getElementById('donutChart').getContext('2d'), c = chartColor();
+            const canvas = document.getElementById('donutChart');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d'), c = chartColor();
             const data = { labels: ['Done','In Progress','To Do'], datasets: [{ data: [s.completedPoints, s.inProgressPoints, s.remainingPoints-s.inProgressPoints], backgroundColor: ['#4ade80','#fbbf24','#f87171'], borderWidth: 0 }] };
             if (donutChart) { donutChart.data = data; donutChart.update(); }
             else { donutChart = new Chart(ctx, { type: 'doughnut', data, options: { cutout: '70%', plugins: { legend: { position: 'bottom', labels: { padding: 20, color: c, font: { family: 'Inter', size: 12 } } } }, responsive: true, maintainAspectRatio: true, animation: { animateRotate: true, animateScale: true, duration: 1200, easing: 'easeOutQuart' } } }); }
         }
         function renderBar(pp) {
-            const f = pp.filter(p => p.assigned > 0), ctx = document.getElementById('barChart').getContext('2d'), c = chartColor(), g = chartGrid();
+            const canvas = document.getElementById('barChart');
+            if (!canvas) return;
+            const f = pp.filter(p => p.assigned > 0), ctx = canvas.getContext('2d'), c = chartColor(), g = chartGrid();
             const data = { labels: f.map(p => p.name.split(' ')[0]), datasets: [{ label: 'Done', data: f.map(p => p.completed), backgroundColor: '#4ade80', borderRadius: 6 },{ label: 'Left', data: f.map(p => p.remaining), backgroundColor: '#f87171', borderRadius: 6 }]};
             if (barChart) { barChart.data = data; barChart.update(); }
             else { barChart = new Chart(ctx, { type: 'bar', data, options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { labels: { color: c, font: { family: 'Inter', size: 12 } } } }, scales: { x: { stacked: true, grid: { color: g }, ticks: { color: c, font: { family: 'Inter' } } }, y: { stacked: true, beginAtZero: true, grid: { color: g }, ticks: { color: c, font: { family: 'Inter' } } } }, animation: { duration: 1000, easing: 'easeOutQuart', delay: function(ctx) { return ctx.dataIndex * 100 + ctx.datasetIndex * 200; } } } }); }
@@ -1026,7 +1032,7 @@
                 </div></td></tr>`;
             }).join('');
         }
-        function toggleDetail(i) { document.getElementById(`md-${i}`).classList.toggle('open'); }
+        function toggleDetail(i) { const el = document.getElementById(`md-${i}`); if (el) el.classList.toggle('open'); }
 
         function renderTrends(history) {
             // Group by sprint name, get latest entry per sprint
@@ -1073,6 +1079,7 @@
         }
 
         function renderAdvanced(adv, ai) {
+            if (!adv || !adv.forecast || !adv.availabilityGap || !adv.scoreCard) return;
             // Forecast (#2)
             const f = adv.forecast;
             const fEl = document.getElementById('forecastValue');
@@ -1211,13 +1218,14 @@
         // Manual refresh
         async function manualRefresh() {
             await fetch('/api/refresh', { method: 'POST' });
-            countdownValue = 300;
+            countdownValue = 600;
             fetchAll();
         }
 
         // Alert functions
         async function alertOne(title, facts, mentionName, mentionEmail) {
-            const btn = event.target;
+            const btn = window.event ? window.event.target : document.activeElement;
+            if (!btn || btn.tagName !== 'BUTTON') return;
             btn.disabled = true; btn.textContent = 'Sending...';
             const sprint = { name: currentSprint, teamName: currentTeam };
             const mention = mentionName ? { name: mentionName, email: mentionEmail } : null;
@@ -1229,7 +1237,9 @@
         }
 
         function alertAll() {
-            document.getElementById('confirmModal').style.display = 'flex';
+            const modal = document.getElementById('confirmModal');
+            if (modal.style.display === 'flex') return;
+            modal.style.display = 'flex';
         }
         function closeModal() {
             document.getElementById('confirmModal').style.display = 'none';
@@ -1259,24 +1269,42 @@
             if (currentSprint) params.set('sprint', currentSprint);
             try {
                 const resp = await fetch(`/api/share-report?${params}`, { method: 'POST' });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 const data = await resp.json();
                 btn.textContent = data.status === 'shared' ? '✓ Shared' : '✗ Failed';
             } catch (e) { btn.textContent = '✗ Failed'; }
             setTimeout(() => { btn.textContent = '📊 Share Report in Teams'; btn.disabled = false; }, 4000);
         }
 
+        const emptyWittyMessages = [
+            "Looks like this sprint is playing hide and seek... and winning. 🙈",
+            "Nothing here. Even the bugs took a day off. 🐛💤",
+            "This sprint is emptier than the office on a Friday afternoon. 🏖️",
+            "404: Sprint data not found. Have you tried turning it off and on again? 🔌",
+            "The backlog stared back into the void... and the void had no tickets. 🕳️",
+            "Congrats! You found the one sprint with zero work. Or wrong team. 😅",
+            "This sprint is lighter than my git commit messages. 📝",
+            "No data here. Maybe the tickets migrated south for winter. 🦆",
+            "Plot twist: the sprint was inside you all along. Just not in JIRA. ✨",
+            "Even my AI brain can't find data that doesn't exist. Select another sprint! 🤖",
+        ];
+
         function showEmptyState(msg) {
             document.getElementById('loading').style.display = 'none';
             document.getElementById('dashboard').style.display = 'none';
             document.getElementById('emptyState').style.display = 'block';
             document.getElementById('emptyMsg').textContent = msg || 'No data found';
+            const wittyEl = document.getElementById('emptyWitty');
+            if (wittyEl) wittyEl.textContent = emptyWittyMessages[Math.floor(Math.random() * emptyWittyMessages.length)];
         }
 
         function switchToActiveSprint() {
             const sel = document.getElementById('selSprint');
+            let found = false;
             for (let i = 0; i < sel.options.length; i++) {
-                if (sel.options[i].textContent.includes('[active]')) { sel.selectedIndex = i; break; }
+                if (sel.options[i].textContent.includes('[active]')) { sel.selectedIndex = i; found = true; break; }
             }
+            if (!found) { alert('No active sprint found in the dropdown. Please select manually.'); return; }
             currentSprint = sel.value;
             fetchAll();
         }
@@ -1343,7 +1371,7 @@
 
         // Init
         loadDefaults().then(() => { fetchAll(); startCountdown(); });
-        setInterval(() => { fetchAll(); countdownValue = 300; }, REFRESH_INTERVAL);
+        setInterval(() => { fetchAll(); countdownValue = 600; }, REFRESH_INTERVAL);
     </script>
 </body>
 </html>

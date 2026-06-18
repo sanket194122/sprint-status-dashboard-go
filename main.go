@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,7 +31,9 @@ var (
 	teamName          = envOr("TEAM_NAME", "Titans")
 	projectKey        = envOr("PROJECT_KEY", "CXDV")
 	port              = envOr("DASHBOARD_PORT", "8501")
-	githubToken       = os.Getenv("GITHUB_TOKEN")
+	awsRegion         = envOr("AWS_REGION", "us-east-1")
+	bedrockModel      = envOr("BEDROCK_MODEL", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+	awsProfile        = envOr("AWS_PROFILE", "default")
 	teamsWebhookURL   = os.Getenv("TEAMS_WEBHOOK_URL")
 	teamsGroupWebhook = os.Getenv("TEAMS_GROUP_WEBHOOK_URL")
 	authHeader        string
@@ -233,10 +238,10 @@ type HealthResult struct {
 
 type AIResult struct {
 	Enabled         bool   `json:"enabled"`
-	SprintInsight   string `json:"sprintInsight,omitempty"`
-	RetroPreview    string `json:"retroPreview,omitempty"`
-	ForecastInsight string `json:"forecastInsight,omitempty"`
-	RiskSummary     string `json:"riskSummary,omitempty"`
+	SprintInsight   string `json:"sprintInsight"`
+	RetroPreview    string `json:"retroPreview"`
+	ForecastInsight string `json:"forecastInsight"`
+	RiskSummary     string `json:"riskSummary"`
 }
 
 type HistoryEntry struct {
@@ -585,6 +590,7 @@ func computePerEpic(issues []Issue, tp TimeProgress) []EpicData {
 	type epicAcc struct {
 		EpicData
 		contributors map[string]float64
+		emails       map[string]string
 	}
 	epics := map[string]*epicAcc{}
 	for _, i := range issues {
@@ -594,7 +600,7 @@ func computePerEpic(issues []Issue, tp TimeProgress) []EpicData {
 		}
 		e, ok := epics[key]
 		if !ok {
-			e = &epicAcc{EpicData: EpicData{EpicKey: key, EpicName: key}, contributors: map[string]float64{}}
+			e = &epicAcc{EpicData: EpicData{EpicKey: key, EpicName: key}, contributors: map[string]float64{}, emails: map[string]string{}}
 			epics[key] = e
 		}
 		e.Total += i.StoryPoints
@@ -605,6 +611,9 @@ func computePerEpic(issues []Issue, tp TimeProgress) []EpicData {
 		}
 		if i.Assignee != "Unassigned" {
 			e.contributors[i.Assignee] += i.StoryPoints
+			if i.AssigneeEmail != "" {
+				e.emails[i.Assignee] = i.AssigneeEmail
+			}
 		}
 	}
 
@@ -628,6 +637,7 @@ func computePerEpic(issues []Issue, tp TimeProgress) []EpicData {
 		}
 		if topName != "" {
 			e.EpicOwner = topName
+			e.EpicOwnerEmail = e.emails[topName]
 		} else {
 			e.EpicOwner = "Unassigned"
 		}
@@ -828,7 +838,7 @@ func computeAdvanced(issues []Issue, tp TimeProgress, startStr, endStr string) A
 		if i.StatusCategory == "Done" {
 			continue
 		}
-		if (i.StatusCategory == "To Do" && tp.WorkingDaysRemain <= 2) || (i.StoryPoints >= 5 && i.StatusCategory == "To Do") {
+		if (i.StatusCategory == "To Do" && tp.WorkingDaysRemain <= 2) || (i.StoryPoints >= 5 && i.StatusCategory == "To Do" && tp.WorkingDaysRemain <= 3) {
 			carryOver = append(carryOver, AlertItem{Key: i.Key, Summary: i.Summary, Points: i.StoryPoints, Status: i.Status, Assignee: i.Assignee})
 		}
 	}
@@ -1040,24 +1050,24 @@ func handleAll(w http.ResponseWriter, r *http.Request) {
 
 	boardID, err := findBoard(proj)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		writeJSON(w, map[string]interface{}{"empty": true, "message": fmt.Sprintf("Board not found for project %s", proj)})
 		return
 	}
 	sprint, err := findSprint(boardID, sprintN)
 	if err != nil {
-		writeJSON(w, map[string]interface{}{"error": err.Error()})
+		writeJSON(w, map[string]interface{}{"empty": true, "message": fmt.Sprintf("Sprint not found: %s", err.Error()), "sprint": map[string]interface{}{"name": sprintN, "teamName": team, "jiraBaseUrl": jiraBaseURL}})
 		return
 	}
 	issues, err := getSprintIssues(sprint.ID, proj, team)
 	if err != nil {
-		writeJSON(w, map[string]interface{}{"empty": true, "message": fmt.Sprintf("Error fetching issues: %s", err.Error()), "sprint": map[string]interface{}{"name": sprint.Name, "teamName": team}})
+		writeJSON(w, map[string]interface{}{"empty": true, "message": fmt.Sprintf("Error fetching issues: %s", err.Error()), "sprint": map[string]interface{}{"name": sprint.Name, "teamName": team, "jiraBaseUrl": jiraBaseURL}})
 		return
 	}
 	if issues == nil {
 		issues = []Issue{}
 	}
 	if len(issues) == 0 {
-		writeJSON(w, map[string]interface{}{"empty": true, "message": fmt.Sprintf("%s has no issues in %s", team, sprint.Name), "sprint": map[string]interface{}{"name": sprint.Name, "teamName": team}})
+		writeJSON(w, map[string]interface{}{"empty": true, "message": fmt.Sprintf("%s has no issues in %s", team, sprint.Name), "sprint": map[string]interface{}{"name": sprint.Name, "teamName": team, "jiraBaseUrl": jiraBaseURL}})
 		return
 	}
 
@@ -1069,6 +1079,58 @@ func handleAll(w http.ResponseWriter, r *http.Request) {
 	saveHistory(sprint.Name, summary, advanced, proj, team)
 	history := getHistory(proj, team)
 
+	// AI-powered risk analysis via Bedrock Claude
+	aiResult := AIResult{Enabled: isAIEnabled()}
+	if aiResult.Enabled {
+		epicSummary := ""
+		for _, e := range summary.PerEpic {
+			epicSummary += fmt.Sprintf("- %s: %g/%g pts done (%.0f%%), risk: %s\n", e.EpicName, e.Completed, e.Total, e.CompletionPct, e.RiskStatus)
+		}
+		prompt := fmt.Sprintf(`You are a senior Agile delivery coach. Analyze this sprint:
+
+SPRINT: %s | Team: %s | Time elapsed: %.0f%% | Working days left: %d
+
+EPICS:
+%s
+METRICS: Velocity %.1f pts/day, Scope creep %d%%, Focus factor %d%%, Aging items %d
+
+Provide a JSON response with:
+{"sprintInsight": "2-3 sentence health summary", "retroPreview": "What's going well + what needs attention (2 bullets each)", "riskSummary": "one sentence biggest risk"}
+
+Respond ONLY with valid JSON, no markdown.`, sprint.Name, team, tp.TimeElapsedPct, tp.WorkingDaysRemain, epicSummary, advanced.Forecast.DailyVelocity, advanced.ScopeCreep.PctOfSprint, advanced.FocusFactor, len(advanced.AgingWIP))
+
+		aiText, err := callAI(prompt)
+		if err == nil && aiText != "" {
+			// Extract JSON from response (handle markdown fences, nested objects, etc.)
+			jsonMatch := aiText
+			if idx := strings.Index(aiText, "{"); idx >= 0 {
+				if end := strings.LastIndex(aiText, "}"); end > idx {
+					jsonMatch = aiText[idx : end+1]
+				}
+			}
+			// Try parsing as map[string]interface{} to handle any value type
+			var parsed map[string]interface{}
+			if parseErr := json.Unmarshal([]byte(jsonMatch), &parsed); parseErr == nil {
+				if v, ok := parsed["sprintInsight"]; ok {
+					aiResult.SprintInsight = fmt.Sprintf("%v", v)
+				}
+				if v, ok := parsed["retroPreview"]; ok {
+					aiResult.RetroPreview = fmt.Sprintf("%v", v)
+				}
+				if v, ok := parsed["riskSummary"]; ok {
+					aiResult.RiskSummary = fmt.Sprintf("%v", v)
+				}
+				log.Printf("  [AI] Analysis complete: insight=%d chars", len(aiResult.SprintInsight))
+			} else {
+				// If JSON parse fails, use entire text as sprint insight
+				aiResult.SprintInsight = strings.TrimSpace(aiText)
+				log.Printf("  [AI] JSON parse failed, using raw text: %s", parseErr)
+			}
+		} else if err != nil {
+			log.Printf("  [AI] Failed: %s", err)
+		}
+	}
+
 	resp := map[string]interface{}{
 		"sprint":   map[string]interface{}{"id": sprint.ID, "name": sprint.Name, "state": sprint.State, "startDate": sprint.StartDate, "endDate": sprint.EndDate, "teamName": team, "projectKey": proj, "jiraBaseUrl": jiraBaseURL},
 		"summary":  summary,
@@ -1076,7 +1138,7 @@ func handleAll(w http.ResponseWriter, r *http.Request) {
 		"issues":   issues,
 		"advanced": advanced,
 		"history":  history,
-		"ai":       AIResult{Enabled: githubToken != ""},
+		"ai":       aiResult,
 	}
 	writeJSON(w, resp)
 }
@@ -1180,14 +1242,311 @@ func handleRefresh(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "cache cleared"})
 }
 
-func sendTeamsNotification(title string, facts []map[string]string) {
+// ---------- AWS Credentials (reads from ~/.aws/credentials) ----------
+
+type awsCreds struct {
+	AccessKey    string
+	SecretKey    string
+	SessionToken string
+}
+
+func getAWSCreds() (*awsCreds, error) {
+	// First try env vars
+	ak := os.Getenv("AWS_ACCESS_KEY_ID")
+	sk := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	st := os.Getenv("AWS_SESSION_TOKEN")
+	if ak != "" && sk != "" {
+		return &awsCreds{AccessKey: ak, SecretKey: sk, SessionToken: st}, nil
+	}
+
+	// Read from ~/.aws/credentials file
+	home, _ := os.UserHomeDir()
+	credFile := filepath.Join(home, ".aws", "credentials")
+	data, err := os.ReadFile(credFile)
+	if err != nil {
+		return nil, fmt.Errorf("no AWS credentials found (env vars or %s)", credFile)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	profile := "[" + awsProfile + "]"
+	inProfile := false
+	creds := &awsCreds{}
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == profile {
+			inProfile = true
+			continue
+		}
+		if strings.HasPrefix(line, "[") && inProfile {
+			break // hit next profile
+		}
+		if inProfile {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			switch key {
+			case "aws_access_key_id":
+				creds.AccessKey = val
+			case "aws_secret_access_key":
+				creds.SecretKey = val
+			case "aws_session_token":
+				creds.SessionToken = val
+			}
+		}
+	}
+
+	if creds.AccessKey == "" || creds.SecretKey == "" {
+		return nil, fmt.Errorf("profile [%s] not found or incomplete in %s", awsProfile, credFile)
+	}
+	return creds, nil
+}
+
+func isAIEnabled() bool {
+	creds, err := getAWSCreds()
+	if err == nil && creds.AccessKey != "" {
+		return true
+	}
+	return os.Getenv("GITHUB_TOKEN") != "" || os.Getenv("GH_MODELS_TOKEN") != ""
+}
+
+// ---------- AWS Bedrock (Claude) ----------
+
+func awsSign(method, host, path, region, service string, body []byte, creds *awsCreds) *http.Request {
+	t := time.Now().UTC()
+	datestamp := t.Format("20060102")
+	amzdate := t.Format("20060102T150405Z")
+	bodyHash := sha256Hex(body)
+
+	// Build canonical headers (must be sorted)
+	canonicalHeaders := fmt.Sprintf("content-type:application/json\nhost:%s\nx-amz-date:%s\n", host, amzdate)
+	signedHeaders := "content-type;host;x-amz-date"
+	if creds.SessionToken != "" {
+		canonicalHeaders = fmt.Sprintf("content-type:application/json\nhost:%s\nx-amz-date:%s\nx-amz-security-token:%s\n", host, amzdate, creds.SessionToken)
+		signedHeaders = "content-type;host;x-amz-date;x-amz-security-token"
+	}
+
+	canonicalRequest := fmt.Sprintf("%s\n%s\n\n%s\n%s\n%s", method, path, canonicalHeaders, signedHeaders, bodyHash)
+
+	credentialScope := fmt.Sprintf("%s/%s/%s/aws4_request", datestamp, region, service)
+	stringToSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%s", amzdate, credentialScope, sha256Hex([]byte(canonicalRequest)))
+
+	signingKey := hmacSHA256(hmacSHA256(hmacSHA256(hmacSHA256([]byte("AWS4"+creds.SecretKey), datestamp), region), service), "aws4_request")
+	signature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
+
+	authorizationHeader := fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s", creds.AccessKey, credentialScope, signedHeaders, signature)
+
+	req, _ := http.NewRequest(method, "https://"+host+path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Amz-Date", amzdate)
+	req.Header.Set("Authorization", authorizationHeader)
+	if creds.SessionToken != "" {
+		req.Header.Set("X-Amz-Security-Token", creds.SessionToken)
+	}
+	return req
+}
+
+func sha256Hex(data []byte) string {
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
+}
+
+func hmacSHA256(key []byte, data string) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(data))
+	return h.Sum(nil)
+}
+
+// callAI tries Bedrock first, falls back to GitHub Models (free GPT-4o-mini)
+func callAI(prompt string) (string, error) {
+	// Try Bedrock first
+	creds, err := getAWSCreds()
+	if err == nil {
+		text, err := callBedrockDirect(prompt, creds)
+		if err == nil {
+			return text, nil
+		}
+		log.Printf("  [AI] Bedrock failed: %s, trying GitHub Models fallback...", err)
+	}
+
+	// Fallback: GitHub Models (free GPT-4o-mini)
+	githubToken := os.Getenv("GITHUB_TOKEN")
+	if githubToken == "" {
+		githubToken = os.Getenv("GH_MODELS_TOKEN") // Codespaces can't use GITHUB_ prefix
+	}
+	if githubToken == "" {
+		return "", fmt.Errorf("no AI provider available (Bedrock creds missing, GITHUB_TOKEN/GH_MODELS_TOKEN not set)")
+	}
+	return callGitHubModelsFree(prompt, githubToken)
+}
+
+func callBedrockDirect(prompt string, creds *awsCreds) (string, error) {
+	payload := map[string]interface{}{
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": []map[string]interface{}{{"text": prompt}}},
+		},
+		"inferenceConfig": map[string]interface{}{"maxTokens": 1500, "temperature": 0.3},
+	}
+	body, _ := json.Marshal(payload)
+
+	host := fmt.Sprintf("bedrock-runtime.%s.amazonaws.com", awsRegion)
+	path := fmt.Sprintf("/model/%s/converse", bedrockModel)
+	req := awsSign("POST", host, path, awsRegion, "bedrock", body, creds)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("bedrock request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("bedrock %d: %s", resp.StatusCode, string(respBody[:min(len(respBody), 100)]))
+	}
+
+	var result struct {
+		Output struct {
+			Message struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"message"`
+		} `json:"output"`
+	}
+	json.Unmarshal(respBody, &result)
+	if len(result.Output.Message.Content) == 0 {
+		return "", fmt.Errorf("empty bedrock response")
+	}
+	log.Printf("  [AI] Bedrock (Claude) response: %d chars", len(result.Output.Message.Content[0].Text))
+	return result.Output.Message.Content[0].Text, nil
+}
+
+func callGitHubModelsFree(prompt, token string) (string, error) {
+	payload := map[string]interface{}{
+		"model":       "gpt-4o-mini",
+		"messages":    []map[string]interface{}{{"role": "user", "content": prompt}},
+		"temperature": 0.3,
+		"max_tokens":  1500,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest("POST", "https://models.inference.ai.azure.com/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("github models failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("github models %d: %s", resp.StatusCode, string(respBody[:min(len(respBody), 100)]))
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	json.Unmarshal(respBody, &result)
+	if len(result.Choices) == 0 {
+		return "", fmt.Errorf("empty github models response")
+	}
+	log.Printf("  [AI] GitHub Models (GPT-4o-mini) response: %d chars", len(result.Choices[0].Message.Content))
+	return result.Choices[0].Message.Content, nil
+}
+
+var teamsWittyMessages = map[string][]string{
+	"epic": {
+		"This epic is giving 'I'll finish it next sprint' energy. 🙃",
+		"Houston, we have an epic problem. 🚀💥",
+		"This epic aged like milk, not wine. 🧀",
+		"Someone call 911 — this epic needs emergency care. 🚑",
+		"This epic is moving slower than Monday morning standup. ☕",
+		"Plot twist: the epic decided it belongs in another sprint. 📖",
+	},
+	"stuck": {
+		"This ticket hasn't moved since dinosaurs roamed the earth. 🦕",
+		"Is this ticket on vacation? Asking for the sprint goal. 🏖️",
+		"This item is stuck longer than my last Windows update. 💻",
+		"Day 5+: Still waiting. Send snacks. 🍕",
+		"This ticket is collecting dust like my gym membership. 🏋️",
+		"Knock knock. Who's there? Not this ticket — it's stuck. 🚪",
+	},
+	"forecast": {
+		"At this velocity, we'll finish... eventually. ⏳",
+		"Sprint goal watching the team like: 👀",
+		"The burndown chart is more of a flat line at this point. 📉",
+		"We're behind schedule. Time to cancel some meetings. 📅",
+	},
+	"scope": {
+		"Scope creep alert! Someone's been sneaking items in. 🛒",
+		"The backlog is growing faster than a Slack thread. 💬",
+		"Who ordered extra scope? Nobody? Thought so. 🤷",
+		"Sprint scope expanding like a dev's estimate of '2 hours'. ⏰",
+	},
+	"unassigned": {
+		"These orphan tickets need a loving developer. 🥺",
+		"Free tickets! No takers? Anyone? Bueller? 🎬",
+		"These tickets are like gym memberships — nobody's showing up. 🏋️",
+	},
+}
+
+func getTeamsWitty(category string) string {
+	msgs := teamsWittyMessages[category]
+	if len(msgs) == 0 {
+		msgs = []string{"Attention needed! Time to take action. 👀"}
+	}
+	return msgs[time.Now().UnixNano()%int64(len(msgs))]
+}
+
+type mention struct {
+	Name  string
+	Email string
+}
+
+func sendTeamsNotification(title string, facts []map[string]string, mentions ...mention) {
 	if teamsWebhookURL == "" {
 		return
 	}
+
+	// Determine category for witty message
+	category := "epic"
+	titleLower := strings.ToLower(title)
+	if strings.Contains(titleLower, "stuck") {
+		category = "stuck"
+	} else if strings.Contains(titleLower, "forecast") || strings.Contains(titleLower, "behind") {
+		category = "forecast"
+	} else if strings.Contains(titleLower, "scope") {
+		category = "scope"
+	} else if strings.Contains(titleLower, "unassigned") {
+		category = "unassigned"
+	}
+	witty := getTeamsWitty(category)
+
+	// Determine severity color
+	alertColor := "Accent"
+	emoji := "🔵"
+	if strings.Contains(titleLower, "not deliverable") || strings.Contains(titleLower, "stuck") {
+		alertColor = "Attention"
+		emoji = "🔴"
+	} else if strings.Contains(titleLower, "risk") || strings.Contains(titleLower, "behind") || strings.Contains(titleLower, "scope") {
+		alertColor = "Warning"
+		emoji = "🟠"
+	}
+
 	factItems := make([]interface{}, 0)
 	for _, f := range facts {
 		factItems = append(factItems, map[string]string{"title": f["name"], "value": "**" + f["value"] + "**"})
 	}
+
 	card := map[string]interface{}{
 		"type": "message",
 		"attachments": []interface{}{map[string]interface{}{
@@ -1196,12 +1555,65 @@ func sendTeamsNotification(title string, facts []map[string]string) {
 				"$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
 				"type": "AdaptiveCard", "version": "1.5",
 				"body": []interface{}{
-					map[string]interface{}{"type": "TextBlock", "text": "🚨 " + title, "weight": "Bolder", "size": "Medium"},
-					map[string]interface{}{"type": "FactSet", "facts": factItems},
+					// Header container
+					map[string]interface{}{
+						"type": "Container", "style": "emphasis", "bleed": true,
+						"items": []interface{}{
+							map[string]interface{}{"type": "TextBlock", "text": emoji + " SPRINT ALERT", "size": "Small", "weight": "Bolder", "color": alertColor},
+							map[string]interface{}{"type": "TextBlock", "text": title, "size": "Large", "weight": "Bolder", "wrap": true, "spacing": "Small"},
+						},
+					},
+					// Witty message
+					map[string]interface{}{"type": "TextBlock", "text": "💬 _" + witty + "_", "wrap": true, "size": "Medium", "spacing": "Medium"},
+					// Facts with separator
+					map[string]interface{}{
+						"type": "ColumnSet", "separator": true, "spacing": "Medium",
+						"columns": []interface{}{map[string]interface{}{
+							"type": "Column", "width": "stretch",
+							"items": []interface{}{map[string]interface{}{"type": "FactSet", "facts": factItems}},
+						}},
+					},
+					// Footer
+					map[string]interface{}{"type": "TextBlock", "text": fmt.Sprintf("📋 Team: **%s** | Sprint: **%s**", teamName, sprintName), "size": "Small", "isSubtle": true, "separator": true, "spacing": "Medium", "wrap": true},
+					// Action required with @mention
+					map[string]interface{}{"type": "TextBlock", "text": func() string {
+						for _, m := range mentions {
+							if m.Name != "" && m.Name != "Unassigned" {
+								return "⚡ <at>" + m.Name + "</at> — please take action!"
+							}
+						}
+						for _, f := range facts {
+							if (f["name"] == "Owner" || f["name"] == "Assignee") && f["value"] != "" && f["value"] != "Unassigned" {
+								return "⚡ <at>" + f["value"] + "</at> — please take action!"
+							}
+						}
+						return "⚡ **Action Required** — Please review and take action."
+					}(), "weight": "Bolder", "size": "Medium", "color": alertColor, "spacing": "Medium", "wrap": true},
 				},
+				"msteams": func() interface{} {
+					// Build mention entities from mentions + facts
+					entities := make([]interface{}, 0)
+					for _, m := range mentions {
+						if m.Name != "" && m.Name != "Unassigned" && m.Email != "" {
+							entities = append(entities, map[string]interface{}{"type": "mention", "text": "<at>" + m.Name + "</at>", "mentioned": map[string]string{"id": m.Email, "name": m.Name}})
+						}
+					}
+					if len(entities) == 0 {
+						for _, f := range facts {
+							if (f["name"] == "Owner" || f["name"] == "Assignee") && f["value"] != "" && f["value"] != "Unassigned" {
+								entities = append(entities, map[string]interface{}{"type": "mention", "text": "<at>" + f["value"] + "</at>", "mentioned": map[string]string{"id": f["value"] + "@nice.com", "name": f["value"]}})
+							}
+						}
+					}
+					if len(entities) > 0 {
+						return map[string]interface{}{"entities": entities}
+					}
+					return nil
+				}(),
 			},
 		}},
 	}
+
 	body, _ := json.Marshal(card)
 	resp, err := httpClient.Post(teamsWebhookURL, "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -1209,7 +1621,7 @@ func sendTeamsNotification(title string, facts []map[string]string) {
 		return
 	}
 	resp.Body.Close()
-	log.Printf("  [Teams] Sent: %s (%d)", title, resp.StatusCode)
+	log.Printf("  [Teams] Sent: %s (%d) — %s", title, resp.StatusCode, witty)
 }
 
 func handleAlert(w http.ResponseWriter, r *http.Request) {
@@ -1239,13 +1651,13 @@ func handleAlertAll(w http.ResponseWriter, r *http.Request) {
 	count := 0
 	for _, e := range summary.PerEpic {
 		if e.RiskStatus == "Not Deliverable" || e.RiskStatus == "At Risk" {
-			sendTeamsNotification("Epic "+e.RiskStatus+": "+e.EpicKey, []map[string]string{{"name": "Epic", "value": e.EpicName}, {"name": "Progress", "value": fmt.Sprintf("%.0f%%", e.CompletionPct)}, {"name": "Owner", "value": e.EpicOwner}})
+			sendTeamsNotification("Epic "+e.RiskStatus+": "+e.EpicKey, []map[string]string{{"name": "Epic", "value": e.EpicName}, {"name": "Progress", "value": fmt.Sprintf("%.0f%%", e.CompletionPct)}, {"name": "Owner", "value": e.EpicOwner}}, mention{Name: e.EpicOwner, Email: e.EpicOwnerEmail})
 			count++
 		}
 	}
 	for _, a := range advanced.AgingWIP {
 		if a.DaysStuck >= 5 {
-			sendTeamsNotification(fmt.Sprintf("Item Stuck %d Days", a.DaysStuck), []map[string]string{{"name": "Issue", "value": a.Key}, {"name": "Days", "value": fmt.Sprintf("%d", a.DaysStuck)}, {"name": "Assignee", "value": a.Assignee}})
+			sendTeamsNotification(fmt.Sprintf("Item Stuck %d Days", a.DaysStuck), []map[string]string{{"name": "Issue", "value": a.Key}, {"name": "Days", "value": fmt.Sprintf("%d", a.DaysStuck)}, {"name": "Assignee", "value": a.Assignee}}, mention{Name: a.Assignee, Email: a.AssigneeEmail})
 			count++
 		}
 	}
@@ -1377,7 +1789,14 @@ func main() {
 	fmt.Printf("  Sprint:  %s\n", sprintName)
 	fmt.Printf("  Team:    %s\n", teamName)
 	fmt.Printf("  JIRA:    %s\n", jiraBaseURL)
-	fmt.Printf("  AI:      %v\n", githubToken != "")
+	creds, credErr := getAWSCreds()
+	if credErr == nil && creds.AccessKey != "" {
+		fmt.Printf("  AI:      Bedrock Claude Sonnet 4 (%s)\n", awsRegion)
+	} else if os.Getenv("GITHUB_TOKEN") != "" {
+		fmt.Println("  AI:      GitHub Models (GPT-4o-mini, fallback)")
+	} else {
+		fmt.Println("  AI:      Disabled (no Bedrock creds or GITHUB_TOKEN)")
+	}
 	fmt.Printf("  Port:    %s\n", port)
 	fmt.Printf("  Serving: http://localhost:%s\n", port)
 
