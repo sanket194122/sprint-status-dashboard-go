@@ -1,0 +1,21 @@
+{
+  "name": "Sprint Status Dashboard",
+  "image": "mcr.microsoft.com/devcontainers/go:1.21",
+  "forwardPorts": [8501],
+  "portsAttributes": {
+    "8501": {
+      "label": "Dashboard",
+      "onAutoForward": "openBrowser",
+      "visibility": "public"
+    }
+  },
+  "postCreateCommand": "go build -o sprint-dashboard .",
+  "postStartCommand": "nohup ./sprint-dashboard > /tmp/dashboard.log 2>&1 &",
+  "remoteEnv": {
+    "CONFLUENCE_USERNAME": "${localEnv:CONFLUENCE_USERNAME}",
+    "CONFLUENCE_TOKEN": "${localEnv:CONFLUENCE_TOKEN}",
+    "GITHUB_TOKEN": "${localEnv:GITHUB_TOKEN}",
+    "TEAMS_WEBHOOK_URL": "${localEnv:TEAMS_WEBHOOK_URL}",
+    "DASHBOARD_PORT": "8501"
+  }
+}
