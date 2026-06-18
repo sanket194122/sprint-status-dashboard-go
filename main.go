@@ -1547,70 +1547,68 @@ func sendTeamsNotification(title string, facts []map[string]string, mentions ...
 		factItems = append(factItems, map[string]string{"title": f["name"], "value": "**" + f["value"] + "**"})
 	}
 
+	// Find person to mention
+	mentionName := ""
+	mentionEmail := ""
+	for _, m := range mentions {
+		if m.Name != "" && m.Name != "Unassigned" {
+			mentionName = m.Name
+			mentionEmail = m.Email
+			break
+		}
+	}
+	if mentionName == "" {
+		for _, f := range facts {
+			if (f["name"] == "Owner" || f["name"] == "Assignee") && f["value"] != "" && f["value"] != "Unassigned" {
+				mentionName = f["value"]
+				mentionEmail = strings.ToLower(strings.ReplaceAll(f["value"], " ", ".")) + "@nice.com"
+				break
+			}
+		}
+	}
+
+	// Build action text
+	actionText := "⚡ **Action Required** — Please review and take action."
+	if mentionName != "" {
+		actionText = "⚡ <at>" + mentionName + "</at> — please take action!"
+	}
+
+	// Build body
+	bodyItems := []interface{}{
+		map[string]interface{}{"type": "TextBlock", "text": emoji + " SPRINT ALERT", "size": "Small", "weight": "Bolder", "color": alertColor},
+		map[string]interface{}{"type": "TextBlock", "text": title, "size": "Large", "weight": "Bolder", "wrap": true, "spacing": "Small"},
+		map[string]interface{}{"type": "TextBlock", "text": "💬 _" + witty + "_", "wrap": true, "spacing": "Medium"},
+		map[string]interface{}{"type": "FactSet", "facts": factItems},
+		map[string]interface{}{"type": "TextBlock", "text": fmt.Sprintf("📋 Team: **%s** | Sprint: **%s**", teamName, sprintName), "size": "Small", "isSubtle": true, "separator": true, "spacing": "Medium", "wrap": true},
+		map[string]interface{}{"type": "TextBlock", "text": actionText, "weight": "Bolder", "size": "Medium", "color": alertColor, "spacing": "Medium", "wrap": true},
+	}
+
+	// Build content with msteams entities
+	content := map[string]interface{}{
+		"type":    "AdaptiveCard",
+		"version": "1.5",
+		"body":    bodyItems,
+	}
+	if mentionName != "" && mentionEmail != "" {
+		content["msteams"] = map[string]interface{}{
+			"entities": []interface{}{
+				map[string]interface{}{
+					"type": "mention",
+					"text": "<at>" + mentionName + "</at>",
+					"mentioned": map[string]string{
+						"id":   mentionEmail,
+						"name": mentionName,
+					},
+				},
+			},
+		}
+	}
+
 	card := map[string]interface{}{
 		"type": "message",
 		"attachments": []interface{}{map[string]interface{}{
 			"contentType": "application/vnd.microsoft.card.adaptive",
-			"content": map[string]interface{}{
-				"$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-				"type": "AdaptiveCard", "version": "1.5",
-				"body": []interface{}{
-					// Header container
-					map[string]interface{}{
-						"type": "Container", "style": "emphasis", "bleed": true,
-						"items": []interface{}{
-							map[string]interface{}{"type": "TextBlock", "text": emoji + " SPRINT ALERT", "size": "Small", "weight": "Bolder", "color": alertColor},
-							map[string]interface{}{"type": "TextBlock", "text": title, "size": "Large", "weight": "Bolder", "wrap": true, "spacing": "Small"},
-						},
-					},
-					// Witty message
-					map[string]interface{}{"type": "TextBlock", "text": "💬 _" + witty + "_", "wrap": true, "size": "Medium", "spacing": "Medium"},
-					// Facts with separator
-					map[string]interface{}{
-						"type": "ColumnSet", "separator": true, "spacing": "Medium",
-						"columns": []interface{}{map[string]interface{}{
-							"type": "Column", "width": "stretch",
-							"items": []interface{}{map[string]interface{}{"type": "FactSet", "facts": factItems}},
-						}},
-					},
-					// Footer
-					map[string]interface{}{"type": "TextBlock", "text": fmt.Sprintf("📋 Team: **%s** | Sprint: **%s**", teamName, sprintName), "size": "Small", "isSubtle": true, "separator": true, "spacing": "Medium", "wrap": true},
-					// Action required with @mention
-					map[string]interface{}{"type": "TextBlock", "text": func() string {
-						for _, m := range mentions {
-							if m.Name != "" && m.Name != "Unassigned" {
-								return "⚡ <at>" + m.Name + "</at> — please take action!"
-							}
-						}
-						for _, f := range facts {
-							if (f["name"] == "Owner" || f["name"] == "Assignee") && f["value"] != "" && f["value"] != "Unassigned" {
-								return "⚡ <at>" + f["value"] + "</at> — please take action!"
-							}
-						}
-						return "⚡ **Action Required** — Please review and take action."
-					}(), "weight": "Bolder", "size": "Medium", "color": alertColor, "spacing": "Medium", "wrap": true},
-				},
-				"msteams": func() interface{} {
-					// Build mention entities from mentions + facts
-					entities := make([]interface{}, 0)
-					for _, m := range mentions {
-						if m.Name != "" && m.Name != "Unassigned" && m.Email != "" {
-							entities = append(entities, map[string]interface{}{"type": "mention", "text": "<at>" + m.Name + "</at>", "mentioned": map[string]string{"id": m.Email, "name": m.Name}})
-						}
-					}
-					if len(entities) == 0 {
-						for _, f := range facts {
-							if (f["name"] == "Owner" || f["name"] == "Assignee") && f["value"] != "" && f["value"] != "Unassigned" {
-								entities = append(entities, map[string]interface{}{"type": "mention", "text": "<at>" + f["value"] + "</at>", "mentioned": map[string]string{"id": f["value"] + "@nice.com", "name": f["value"]}})
-							}
-						}
-					}
-					if len(entities) > 0 {
-						return map[string]interface{}{"entities": entities}
-					}
-					return nil
-				}(),
-			},
+			"content":     content,
 		}},
 	}
 
